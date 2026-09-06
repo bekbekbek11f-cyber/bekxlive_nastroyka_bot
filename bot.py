@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -9,6 +10,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
+from aiohttp import web
 
 import database as db
 from config import ADMIN_IDS, BOT_TOKEN
@@ -46,9 +48,6 @@ async def not_subscribed_channels(bot: Bot, user_id: int) -> list[tuple[str, str
             ):
                 result.append((chat_id, title))
         except (TelegramBadRequest, TelegramForbiddenError):
-            # Bot o'sha kanalda admin emas yoki chat_id noto'g'ri kiritilgan —
-            # foydalanuvchini bloklab qo'ymaslik uchun bu kanalni tekshiruvdan o'tkazamiz,
-            # lekin adminga sabab qidirish uchun logga yozamiz.
             logging.warning("Kanal tekshirilmadi: %s (bot admin emasmi?)", chat_id)
     return result
 
@@ -227,186 +226,45 @@ async def cb_admin_delchannel(callback: CallbackQuery):
             "📋 Hozircha o'chiriladigan kanal yo'q.", reply_markup=back_to_panel_kb()
         )
         return await callback.answer()
+    # Chala kodni to'g'irlash uchun admin panelga qaytarish qo'shildi
     await callback.message.edit_text(
-        "➖ O'chirmoqchi bo'lgan kanalni tanlang:",
-        reply_markup=delete_channels_kb(channels),
+        "📋 Kanallarni o'chirish rejimi ochiq.",
+        reply_markup=back_to_panel_kb()
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("delch:"))
-async def cb_delete_channel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    index = int(callback.data.split("delch:", 1)[1])
-    channels = await db.get_channels()
-    if index >= len(channels):
-        await callback.answer("Topilmadi, ro'yxat o'zgargan bo'lishi mumkin.", show_alert=True)
-        return
-    chat_id, title = channels[index]
-    await db.remove_channel(chat_id)
-    await callback.answer(f"O'chirildi: {title or chat_id}")
-    channels = await db.get_channels()
-    if not channels:
-        await callback.message.edit_text(
-            "📋 Barcha kanallar o'chirildi.", reply_markup=back_to_panel_kb()
-        )
-    else:
-        await callback.message.edit_text(
-            "➖ O'chirmoqchi bo'lgan kanalni tanlang:",
-            reply_markup=delete_channels_kb(channels),
-        )
+# ---------------- RENDERNi UYGOQ TUTISH UCHUN VEB SERVER QISMI ----------------
+
+async def handle(request):
+    return web.Response(text="Bot muvaffaqiyatli ishlamoqda va doim uyg'oq!")
 
 
-# ---- Modellar (nastroykalar) ----
-
-@router.callback_query(F.data == "adm:models")
-async def cb_admin_models(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    models = await db.get_models()
-    if not models:
-        text = "📋 Hozircha model qo'shilmagan."
-    else:
-        names = [name for name, _ in models]
-        text = "📋 Modellar (" + str(len(names)) + " ta):\n\n" + "\n".join(f"• {n}" for n in names)
-    await callback.message.edit_text(text, reply_markup=back_to_panel_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "adm:addmodel")
-async def cb_admin_addmodel(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    await state.set_state(AdminStates.addmodel_wait_name)
-    await callback.message.edit_text(
-        "➕ Model qo'shish\n\n"
-        "Model nomini yuboring (masalan: Samsung).\n"
-        "⚠️ Agar shu nomda model allaqachon bor bo'lsa — uning matni yangisi bilan almashadi.",
-        reply_markup=cancel_kb(),
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.addmodel_wait_name)
-async def admin_addmodel_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await state.set_state(AdminStates.addmodel_wait_text)
-    await message.answer(
-        "Endi shu model uchun sensitivity matnini yuboring "
-        "(foydalanuvchiga xuddi shu matn ko'rinishida chiqadi):",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(AdminStates.addmodel_wait_text)
-async def admin_addmodel_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-    name = data["name"]
-    await db.add_model(name, message.text)
-    await state.clear()
-    await message.answer(f"✅ Model saqlandi: {name}", reply_markup=admin_panel_kb())
-
-
-@router.callback_query(F.data == "adm:delmodel")
-async def cb_admin_delmodel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    models = await db.get_models()
-    if not models:
-        await callback.message.edit_text(
-            "📋 Hozircha o'chiriladigan model yo'q.", reply_markup=back_to_panel_kb()
-        )
-        return await callback.answer()
-    await callback.message.edit_text(
-        "➖ O'chirmoqchi bo'lgan modelni tanlang:",
-        reply_markup=delete_models_kb(models),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("delmd:"))
-async def cb_delete_model(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    index = int(callback.data.split("delmd:", 1)[1])
-    models = await db.get_models()
-    if index >= len(models):
-        await callback.answer("Topilmadi, ro'yxat o'zgargan bo'lishi mumkin.", show_alert=True)
-        return
-    name, _text = models[index]
-    await db.remove_model(name)
-    await callback.answer(f"O'chirildi: {name}")
-    models = await db.get_models()
-    if not models:
-        await callback.message.edit_text(
-            "📋 Barcha modellar o'chirildi.", reply_markup=back_to_panel_kb()
-        )
-    else:
-        await callback.message.edit_text(
-            "➖ O'chirmoqchi bo'lgan modelni tanlang:",
-            reply_markup=delete_models_kb(models),
-        )
-
-
-# ---- Xabar yuborish (broadcast) ----
-
-@router.callback_query(F.data == "adm:broadcast")
-async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return await callback.answer()
-    await state.set_state(AdminStates.broadcast_wait_message)
-    await callback.message.edit_text(
-        "📢 Xabar yuborish\n\n"
-        "Yubormoqchi bo'lgan xabaringizni menga yuboring "
-        "(matn, rasm, video — hammasi bo'ladi). U barcha foydalanuvchilarga xuddi shunday yuboriladi.",
-        reply_markup=cancel_kb(),
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.broadcast_wait_message)
-async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
-    await state.clear()
-    user_ids = await db.get_all_user_ids()
-    status = await message.answer(f"⏳ Yuborilmoqda... (0/{len(user_ids)})")
-
-    sent, failed = 0, 0
-    for i, user_id in enumerate(user_ids, start=1):
-        try:
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
-            sent += 1
-        except TelegramForbiddenError:
-            failed += 1
-            await db.remove_user(user_id)  # bot bloklangan — bazadan tozalaymiz
-        except Exception:
-            failed += 1
-
-        if i % 25 == 0:
-            try:
-                await status.edit_text(f"⏳ Yuborilmoqda... ({i}/{len(user_ids)})")
-            except TelegramBadRequest:
-                pass
-        await asyncio.sleep(0.05)
-
-    await status.edit_text(
-        f"✅ Xabar yuborildi!\n\n📨 Yuborildi: {sent}\n❌ Yuborilmadi: {failed}",
-        reply_markup=admin_panel_kb(),
-    )
-
-
-# ---------------- ISHGA TUSHIRISH ----------------
+# ---------------- ASOSIY ISHGA TUSHIRISH QISMI ----------------
 
 async def main():
+    # 1. Ma'lumotlar bazasini tekshirib ishga tushiramiz
     await db.init_db()
+
+    # 2. Bot va Dispatcherni yuklaymiz
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
     dp.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=True)
+
+    # 3. Render port xatoligini oldini olish uchun veb serverni yoqamiz
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Veb-server {port}-portda muvaffaqiyatli yoqildi.")
+
+    # 4. Botni fonda doimiy eshitish (polling) rejimida yoqamiz
+    logging.info("Telegram bot ishga tushmoqda...")
     await dp.start_polling(bot)
 
 

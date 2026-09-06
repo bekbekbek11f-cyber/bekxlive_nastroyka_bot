@@ -1,13 +1,10 @@
 # Bot birinchi marta ishga tushganda shu modellar avtomatik bazaga qo'shiladi.
-# Free Fire'da barcha sensitivity qiymatlari 0 dan 200 gacha bo'ladi (o'yin ichidagi
-# haqiqiy shkala). Qiymatlar telefon darajasiga qarab farqlanadi:
-# flagman/yuqori ekran chastotali telefonlar balandroq, byudjet telefonlar pastroq.
-#
-# Admin panel orqali (➕ Model qo'shish / ➖ Model o'chirish / 🔄 Standart modellarni
-# tiklash) buni istalgan vaqtda o'zgartirish yoki yangilash mumkin.
+# Keyinchalik admin panel orqali (➕ Model qo'shish / ➖ Model o'chirish) buni
+# o'zgartirish, o'chirish yoki yangi model qo'shish mumkun.
+# Xuddi shu nomdagi modelni qayta qo'shsangiz — eski matn yangisi bilan almashadi.
 
 DEFAULT_MODELS = {
-    "Samsung": (
+"Samsung": (
         "📱 Samsung — Free Fire sensitivity\n\n"
         "🎯 General: 165\n"
         "🔴 Red Dot: 160\n"

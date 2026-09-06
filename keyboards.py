@@ -35,6 +35,7 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
     builder.button(text="➕ Model qo'shish", callback_data="adm:addmodel")
     builder.button(text="➖ Model o'chirish", callback_data="adm:delmodel")
     builder.button(text="📋 Modellar", callback_data="adm:models")
+    builder.button(text="🔄 Standart modellarni tiklash", callback_data="adm:resetmodels")
     builder.button(text="📊 Statistika", callback_data="adm:stats")
     builder.adjust(2)
     return builder.as_markup()

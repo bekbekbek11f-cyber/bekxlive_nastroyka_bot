@@ -1,15 +1,10 @@
 """
 Bot sozlamalari.
-
-BOT_TOKEN     -> 8839353458:AAHrfZKJTfzAysXcs14d7LLxbPMIt2ajBZI
-ADMIN_IDS     -> 8475619369
-        
 """
+import os
 
-BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
-
-ADMIN_IDS = [
-    8475619369,  # <-- bu yerga o'z Telegram ID'ingizni yozing
-]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS =
 
 DB_PATH = "bot.db"
+

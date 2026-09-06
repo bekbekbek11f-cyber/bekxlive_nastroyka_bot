@@ -1,19 +1,17 @@
 import asyncio
 import logging
-import os
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
-from aiohttp import web
 
 import database as db
-from config import ADMIN_IDS, BOT_TOKEN
+from config import ADMIN_IDS, BOT_TOKEN, FREE_MODELS_COUNT
 from keyboards import (
     admin_panel_kb,
     back_to_panel_kb,
@@ -34,6 +32,27 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+_bot_username_cache: dict[str, str] = {}
+
+
+async def get_bot_username(bot: Bot) -> str:
+    if "username" not in _bot_username_cache:
+        me = await bot.get_me()
+        _bot_username_cache["username"] = me.username
+    return _bot_username_cache["username"]
+
+
+async def get_referral_link(bot: Bot, user_id: int) -> str:
+    username = await get_bot_username(bot)
+    return f"https://t.me/{username}?start=ref{user_id}"
+
+
+async def allowed_models_count(user_id: int) -> int:
+    """Foydalanuvchi nechta TURLI modelga kirishi mumkinligi (referalsiz + referallar)."""
+    referrals = await db.get_referral_count(user_id)
+    return FREE_MODELS_COUNT + referrals
+
+
 async def not_subscribed_channels(bot: Bot, user_id: int) -> list[tuple[str, str]]:
     """Foydalanuvchi obuna bo'lmagan kanallar ro'yxatini qaytaradi."""
     channels = await db.get_channels()
@@ -48,6 +67,9 @@ async def not_subscribed_channels(bot: Bot, user_id: int) -> list[tuple[str, str
             ):
                 result.append((chat_id, title))
         except (TelegramBadRequest, TelegramForbiddenError):
+            # Bot o'sha kanalda admin emas yoki chat_id noto'g'ri kiritilgan —
+            # foydalanuvchini bloklab qo'ymaslik uchun bu kanalni tekshiruvdan o'tkazamiz,
+            # lekin adminga sabab qidirish uchun logga yozamiz.
             logging.warning("Kanal tekshirilmadi: %s (bot admin emasmi?)", chat_id)
     return result
 
@@ -59,7 +81,9 @@ async def send_phone_menu(message: Message):
         return
     names = [name for name, _ in models]
     await message.answer(
-        "🎮 Free Fire uchun kerakli telefon modelingizni tanlang:",
+        "🎮 Free Fire uchun kerakli telefon modelingizni tanlang:\n\n"
+        f"ℹ️ Har bir foydalanuvchi {FREE_MODELS_COUNT} ta modelni bepul oladi, "
+        "keyingi har bir model uchun /referral orqali do'st taklif qilish kerak.",
         reply_markup=phone_menu_kb(names),
     )
 
@@ -67,12 +91,34 @@ async def send_phone_menu(message: Message):
 # ---------------- FOYDALANUVCHI QISMI ----------------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, bot: Bot):
+async def cmd_start(message: Message, bot: Bot, command: CommandObject):
+    user_id = message.from_user.id
+    is_new_user = not await db.user_exists(user_id)
+
     await db.add_user(
-        message.from_user.id,
+        user_id,
         message.from_user.username or "",
         message.from_user.first_name or "",
     )
+
+    # Referal orqali kirgan bo'lsa (faqat BIRINCHI marta /start bosganda hisoblanadi)
+    payload = command.args or ""
+    if is_new_user and payload.startswith("ref"):
+        try:
+            referrer_id = int(payload[3:])
+        except ValueError:
+            referrer_id = None
+        if referrer_id and referrer_id != user_id and await db.user_exists(referrer_id):
+            await db.set_referred_by(user_id, referrer_id)
+            new_count = await db.increment_referral_count(referrer_id)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    "🎉 Sizning havolangiz orqali yangi do'stingiz botga qo'shildi!\n"
+                    f"Endi sizda {FREE_MODELS_COUNT + new_count} ta model uchun nastroyka ochiq.",
+                )
+            except (TelegramForbiddenError, TelegramBadRequest):
+                pass
 
     missing = await not_subscribed_channels(bot, message.from_user.id)
     if missing:
@@ -103,7 +149,9 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("model:"))
 async def cb_model_selected(callback: CallbackQuery, bot: Bot):
-    missing = await not_subscribed_channels(bot, callback.from_user.id)
+    user_id = callback.from_user.id
+
+    missing = await not_subscribed_channels(bot, user_id)
     if missing:
         await callback.answer("❌ Avval kanal(lar)ga obuna bo'ling!", show_alert=True)
         return
@@ -113,8 +161,49 @@ async def cb_model_selected(callback: CallbackQuery, bot: Bot):
     if not text:
         await callback.answer("Bu model topilmadi, ehtimol o'chirilgan.", show_alert=True)
         return
+
+    # Referal cheklovi FAQAT oddiy foydalanuvchilar uchun — adminlar cheklovsiz
+    if not is_admin(user_id):
+        already_unlocked = await db.is_model_unlocked(user_id, name)
+        if not already_unlocked:
+            unlocked_count = await db.count_unlocked_models(user_id)
+            limit = await allowed_models_count(user_id)
+            if unlocked_count >= limit:
+                link = await get_referral_link(bot, user_id)
+                await callback.message.answer(
+                    "🔒 Siz bepul nastroykalar limitidan foydalanib bo'ldingiz!\n\n"
+                    f"Hozircha sizda {unlocked_count} ta model ochilgan.\n"
+                    "Yana 1 ta YANGI model ochish uchun quyidagi shaxsiy havolangiz orqali "
+                    "1 ta do'stingizni botga taklif qiling:\n\n"
+                    f"🔗 {link}\n\n"
+                    "Do'stingiz shu havola orqali botga /start bosishi bilan yangi model "
+                    "avtomatik ochiladi.",
+                )
+                await callback.answer()
+                return
+            await db.unlock_model(user_id, name)
+
     await callback.message.answer(text)
     await callback.answer()
+
+
+@router.message(Command("referral"))
+async def cmd_referral(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    link = await get_referral_link(bot, user_id)
+    referrals = await db.get_referral_count(user_id)
+    unlocked = await db.count_unlocked_models(user_id)
+    limit = FREE_MODELS_COUNT if is_admin(user_id) else await allowed_models_count(user_id)
+
+    text = (
+        "🔗 Sizning shaxsiy referal havolangiz:\n\n"
+        f"{link}\n\n"
+        f"👥 Taklif qilgan do'stlaringiz: {referrals}\n"
+        f"📱 Ochilgan modellar: {unlocked}/{'∞' if is_admin(user_id) else limit}\n\n"
+        "Har bir do'stingiz shu havola orqali botga birinchi marta kirsa, "
+        "sizga 1 ta qo'shimcha model ochiladi."
+    )
+    await message.answer(text)
 
 
 # ---------------- ADMIN PANEL ----------------
@@ -155,7 +244,8 @@ async def cb_admin_stats(callback: CallbackQuery):
         "📊 Statistika:\n\n"
         f"👤 Foydalanuvchilar: {users}\n"
         f"📢 Majburiy kanallar: {len(channels)}\n"
-        f"📱 Modellar soni: {models}"
+        f"📱 Modellar soni: {models}\n"
+        f"🎟 Bepul limit (referalsiz): {FREE_MODELS_COUNT} ta model"
     )
     await callback.message.edit_text(text, reply_markup=back_to_panel_kb())
     await callback.answer()
@@ -226,45 +316,199 @@ async def cb_admin_delchannel(callback: CallbackQuery):
             "📋 Hozircha o'chiriladigan kanal yo'q.", reply_markup=back_to_panel_kb()
         )
         return await callback.answer()
-    # Chala kodni to'g'irlash uchun admin panelga qaytarish qo'shildi
     await callback.message.edit_text(
-        "📋 Kanallarni o'chirish rejimi ochiq.",
-        reply_markup=back_to_panel_kb()
+        "➖ O'chirmoqchi bo'lgan kanalni tanlang:",
+        reply_markup=delete_channels_kb(channels),
     )
     await callback.answer()
 
 
-# ---------------- RENDERNi UYGOQ TUTISH UCHUN VEB SERVER QISMI ----------------
+@router.callback_query(F.data.startswith("delch:"))
+async def cb_delete_channel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    index = int(callback.data.split("delch:", 1)[1])
+    channels = await db.get_channels()
+    if index >= len(channels):
+        await callback.answer("Topilmadi, ro'yxat o'zgargan bo'lishi mumkin.", show_alert=True)
+        return
+    chat_id, title = channels[index]
+    await db.remove_channel(chat_id)
+    await callback.answer(f"O'chirildi: {title or chat_id}")
+    channels = await db.get_channels()
+    if not channels:
+        await callback.message.edit_text(
+            "📋 Barcha kanallar o'chirildi.", reply_markup=back_to_panel_kb()
+        )
+    else:
+        await callback.message.edit_text(
+            "➖ O'chirmoqchi bo'lgan kanalni tanlang:",
+            reply_markup=delete_channels_kb(channels),
+        )
 
-async def handle(request):
-    return web.Response(text="Bot muvaffaqiyatli ishlamoqda va doim uyg'oq!")
+
+# ---- Modellar (nastroykalar) ----
+
+@router.callback_query(F.data == "adm:models")
+async def cb_admin_models(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    models = await db.get_models()
+    if not models:
+        text = "📋 Hozircha model qo'shilmagan."
+    else:
+        names = [name for name, _ in models]
+        text = "📋 Modellar (" + str(len(names)) + " ta):\n\n" + "\n".join(f"• {n}" for n in names)
+    await callback.message.edit_text(text, reply_markup=back_to_panel_kb())
+    await callback.answer()
 
 
-# ---------------- ASOSIY ISHGA TUSHIRISH QISMI ----------------
+@router.callback_query(F.data == "adm:resetmodels")
+async def cb_admin_reset_models(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    count = await db.reset_default_models()
+    await callback.message.edit_text(
+        f"🔄 Standart modellar yangilandi! ({count} ta model qayta yozildi)\n\n"
+        "🛠 Admin panel:",
+        reply_markup=admin_panel_kb(),
+    )
+    await callback.answer("Yangilandi ✅")
+
+
+@router.callback_query(F.data == "adm:addmodel")
+async def cb_admin_addmodel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.set_state(AdminStates.addmodel_wait_name)
+    await callback.message.edit_text(
+        "➕ Model qo'shish\n\n"
+        "Model nomini yuboring (masalan: Samsung).\n"
+        "⚠️ Agar shu nomda model allaqachon bor bo'lsa — uning matni yangisi bilan almashadi.",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.addmodel_wait_name)
+async def admin_addmodel_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(AdminStates.addmodel_wait_text)
+    await message.answer(
+        "Endi shu model uchun sensitivity matnini yuboring "
+        "(foydalanuvchiga xuddi shu matn ko'rinishida chiqadi):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AdminStates.addmodel_wait_text)
+async def admin_addmodel_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    name = data["name"]
+    await db.add_model(name, message.text)
+    await state.clear()
+    await message.answer(f"✅ Model saqlandi: {name}", reply_markup=admin_panel_kb())
+
+
+@router.callback_query(F.data == "adm:delmodel")
+async def cb_admin_delmodel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    models = await db.get_models()
+    if not models:
+        await callback.message.edit_text(
+            "📋 Hozircha o'chiriladigan model yo'q.", reply_markup=back_to_panel_kb()
+        )
+        return await callback.answer()
+    await callback.message.edit_text(
+        "➖ O'chirmoqchi bo'lgan modelni tanlang:",
+        reply_markup=delete_models_kb(models),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delmd:"))
+async def cb_delete_model(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    index = int(callback.data.split("delmd:", 1)[1])
+    models = await db.get_models()
+    if index >= len(models):
+        await callback.answer("Topilmadi, ro'yxat o'zgargan bo'lishi mumkin.", show_alert=True)
+        return
+    name, _text = models[index]
+    await db.remove_model(name)
+    await callback.answer(f"O'chirildi: {name}")
+    models = await db.get_models()
+    if not models:
+        await callback.message.edit_text(
+            "📋 Barcha modellar o'chirildi.", reply_markup=back_to_panel_kb()
+        )
+    else:
+        await callback.message.edit_text(
+            "➖ O'chirmoqchi bo'lgan modelni tanlang:",
+            reply_markup=delete_models_kb(models),
+        )
+
+
+# ---- Xabar yuborish (broadcast) ----
+
+@router.callback_query(F.data == "adm:broadcast")
+async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.set_state(AdminStates.broadcast_wait_message)
+    await callback.message.edit_text(
+        "📢 Xabar yuborish\n\n"
+        "Yubormoqchi bo'lgan xabaringizni menga yuboring "
+        "(matn, rasm, video — hammasi bo'ladi). U barcha foydalanuvchilarga xuddi shunday yuboriladi.",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.broadcast_wait_message)
+async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    user_ids = await db.get_all_user_ids()
+    status = await message.answer(f"⏳ Yuborilmoqda... (0/{len(user_ids)})")
+
+    sent, failed = 0, 0
+    for i, user_id in enumerate(user_ids, start=1):
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            failed += 1
+            await db.remove_user(user_id)  # bot bloklangan — bazadan tozalaymiz
+        except Exception:
+            failed += 1
+
+        if i % 25 == 0:
+            try:
+                await status.edit_text(f"⏳ Yuborilmoqda... ({i}/{len(user_ids)})")
+            except TelegramBadRequest:
+                pass
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        f"✅ Xabar yuborildi!\n\n📨 Yuborildi: {sent}\n❌ Yuborilmadi: {failed}",
+        reply_markup=admin_panel_kb(),
+    )
+
+
+# ---------------- ISHGA TUSHIRISH ----------------
 
 async def main():
-    # 1. Ma'lumotlar bazasini tekshirib ishga tushiramiz
     await db.init_db()
-
-    # 2. Bot va Dispatcherni yuklaymiz
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    # 3. Render port xatoligini oldini olish uchun veb serverni yoqamiz
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Veb-server {port}-portda muvaffaqiyatli yoqildi.")
-
-    # 4. Botni fonda doimiy eshitish (polling) rejimida yoqamiz
-    logging.info("Telegram bot ishga tushmoqda...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 

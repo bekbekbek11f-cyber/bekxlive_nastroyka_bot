@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # agar mahalliy kompyuterda ".env" fayli bo'lsa, o'shandan o'qiydi
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("8839353458:AAHrfZKJTfzAysXcs14d7LLxbPMIt2ajBZI", "")
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip()]
@@ -39,7 +39,7 @@ if not BOT_TOKEN:
         "BOT_TOKEN qo'shganingizni tekshiring."
     )
 
-if not ADMIN_IDS:
+if not ADMIN_IDS:"8475619369"
     raise RuntimeError(
         "ADMIN_IDS topilmadi! .env faylga yoki Render Environment Variables'ga "
         "ADMIN_IDS qo'shganingizni tekshiring (masalan: 123456789,987654321)."
